@@ -6,7 +6,10 @@ bedrock = boto3.client('bedrock-runtime')
 def validate_message(event):
     try:
         body = json.loads(event['body'])
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None, "Invalid JSON"
+    
+    if not isinstance(body, dict):
         return None, "Invalid JSON"
 
     goodkeys = {'sessionId', 'message'}
