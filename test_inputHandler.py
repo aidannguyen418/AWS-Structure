@@ -1,14 +1,19 @@
 import json
 import os
+import time
+import pytest
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-2")  # must come BEFORE the import below
 
 import inputHandler  # change to your file's name, without .py
 
 
-def make_event(payload):
-    """Build an event shaped like API Gateway's: the body is a JSON *string*."""
-    return {"body": json.dumps(payload)}
+def make_event(payload, sub="user-1"):
+    """Build an event shaped like API Gateway's: body is a JSON *string*, plus the verified user."""
+    event = {"body": json.dumps(payload)}
+    if sub is not None:
+        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": sub}}}}
+    return event
 
 
 def test_valid_request_passes():
@@ -115,6 +120,40 @@ class FakeBedrock:
             raise self.error
         return self.response
 
+class FakeTable:
+    """Stands in for the DynamoDB Table. Remembers items and honours pk / newest-first / Limit."""
+
+    def __init__(self, fail_query=False, fail_put=False):
+        self.items = []
+        self.query_calls = []
+        self.put_calls = []
+        self.fail_query = fail_query
+        self.fail_put = fail_put
+
+    def add(self, pk, ts, user_text, assistant_text):
+        self.items.append({"pk": pk, "ts": ts, "userText": user_text, "assistantText": assistant_text})
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        if self.fail_query:
+            raise RuntimeError("DynamoDB is down")
+        wanted_pk = kwargs["KeyConditionExpression"].get_expression()["values"][1]
+        rows = sorted((i for i in self.items if i["pk"] == wanted_pk), key=lambda i: i["ts"])
+        if kwargs.get("ScanIndexForward", True) is False:
+            rows.reverse()
+        return {"Items": rows[: kwargs.get("Limit", len(rows))]}
+
+    def put_item(self, **kwargs):
+        if self.fail_put:
+            raise RuntimeError("DynamoDB is down")
+        self.put_calls.append(kwargs["Item"])
+
+
+@pytest.fixture(autouse=True)
+def fake_table(monkeypatch):
+    table = FakeTable()
+    monkeypatch.setattr(inputHandler, "table", table)
+    return table
 
 def good_reply(text="Hi there!"):
     """The nested shape Bedrock's converse() returns."""
@@ -191,3 +230,150 @@ def test_over_limit_message_returns_400_and_never_calls_bedrock(monkeypatch):
 
     assert result["statusCode"] == 400
     assert fake.calls == []
+
+# ---------------- conversation history ----------------
+
+def test_history_is_sent_oldest_first_and_alternates(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+    fake_table.add("user-1#abc-123", 2000, "second question", "second answer")
+    fake_table.add("user-1#abc-123", 1000, "first question", "first answer")  # out of order on purpose
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    messages = fake.calls[0]["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant", "user"]
+    assert [m["content"][0]["text"] for m in messages] == [
+        "first question", "first answer", "second question", "second answer", "Hello",
+    ]
+
+
+def test_query_reads_only_the_newest_exchanges(fake_table, monkeypatch):
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(response=good_reply()))
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    call = fake_table.query_calls[0]
+    assert call["Limit"] == inputHandler.MAX_HISTORY_TURNS
+    assert call["ScanIndexForward"] is False
+    assert call["ConsistentRead"] is True
+    assert call["KeyConditionExpression"].get_expression()["values"][1] == "user-1#abc-123"
+
+
+def test_only_the_newest_five_of_many_exchanges_are_sent(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+    for n in range(1, 9):  # eight stored exchanges, oldest is n=1
+        fake_table.add("user-1#abc-123", n * 1000, f"q{n}", f"a{n}")
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    texts = [m["content"][0]["text"] for m in fake.calls[0]["messages"]]
+    assert texts[0] == "q4"            # q4..q8 are the newest five
+    assert "q3" not in texts
+    assert len(texts) == 5 * 2 + 1
+
+
+def test_character_budget_drops_the_oldest_exchanges(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+    # 2,500 chars each: two fit in the 6,000 budget, a third does not
+    fake_table.add("user-1#abc-123", 1000, "OLD" + "x" * 1247, "y" * 1250)
+    fake_table.add("user-1#abc-123", 2000, "MID" + "x" * 1247, "y" * 1250)
+    fake_table.add("user-1#abc-123", 3000, "NEW" + "x" * 1247, "y" * 1250)
+    fake_table.add("user-1#abc-123", 4000, "NEWEST" + "x" * 1244, "y" * 1250)
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    user_texts = [m["content"][0]["text"] for m in fake.calls[0]["messages"] if m["role"] == "user"]
+    assert [t[:3] for t in user_texts[:-1]] == ["NEW", "NEW"]  # NEW and NEWEST kept
+    assert not any(t.startswith("OLD") or t.startswith("MID") for t in user_texts)
+
+
+def test_window_stops_at_a_too_big_exchange_instead_of_skipping_it(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+    fake_table.add("user-1#abc-123", 1000, "tiny old question", "tiny old answer")
+    fake_table.add("user-1#abc-123", 2000, "x" * 4000, "y" * 4000)  # newest, bigger than the whole budget
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    assert fake.calls[0]["messages"] == [{"role": "user", "content": [{"text": "Hello"}]}]
+
+
+def test_successful_chat_saves_one_exchange_with_ttl(monkeypatch, fake_table):
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(response=good_reply("Hi there!")))
+
+    inputHandler.lambda_handler(VALID_EVENT, None)
+
+    assert len(fake_table.put_calls) == 1
+    item = fake_table.put_calls[0]
+    assert item["pk"] == "user-1#abc-123"
+    assert item["userText"] == "Hello"
+    assert item["assistantText"] == "Hi there!"
+    assert isinstance(item["ts"], int) and isinstance(item["expiresAt"], int)
+    assert abs(item["ts"] / 1000 - time.time()) < 5                      # milliseconds
+    assert abs(item["expiresAt"] - (time.time() + 7 * 24 * 3600)) < 5    # seconds, 7 days out
+
+
+def test_failed_bedrock_call_saves_nothing(monkeypatch, fake_table):
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(error=RuntimeError("boom")))
+    inputHandler.lambda_handler(VALID_EVENT, None)
+    assert fake_table.put_calls == []
+
+
+def test_malformed_bedrock_response_saves_nothing(monkeypatch, fake_table):
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(response={"output": {}}))
+    inputHandler.lambda_handler(VALID_EVENT, None)
+    assert fake_table.put_calls == []
+
+
+def test_blank_reply_is_not_saved(monkeypatch, fake_table):
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(response=good_reply("   ")))
+    inputHandler.lambda_handler(VALID_EVENT, None)
+    assert fake_table.put_calls == []
+
+
+def test_one_user_cannot_read_another_users_history(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+    fake_table.add("user-2#abc-123", 1000, "user two's secret question", "user two's secret answer")
+
+    inputHandler.lambda_handler(make_event({"sessionId": "abc-123", "message": "Hello"}, sub="user-1"), None)
+
+    texts = [m["content"][0]["text"] for m in fake.calls[0]["messages"]]
+    assert texts == ["Hello"]
+
+
+def test_missing_user_claim_returns_401_and_touches_nothing(monkeypatch, fake_table):
+    fake = FakeBedrock(response=good_reply())
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+
+    result = inputHandler.lambda_handler(make_event({"sessionId": "abc-123", "message": "Hello"}, sub=None), None)
+
+    assert result["statusCode"] == 401
+    assert fake.calls == []
+    assert fake_table.query_calls == []
+    assert fake_table.put_calls == []
+
+
+def test_history_load_failure_still_answers(monkeypatch):
+    monkeypatch.setattr(inputHandler, "table", FakeTable(fail_query=True))
+    fake = FakeBedrock(response=good_reply("still here"))
+    monkeypatch.setattr(inputHandler, "bedrock", fake)
+
+    result = inputHandler.lambda_handler(VALID_EVENT, None)
+
+    assert result["statusCode"] == 200
+    assert json.loads(result["body"]) == {"reply": "still here"}
+    assert fake.calls[0]["messages"] == [{"role": "user", "content": [{"text": "Hello"}]}]
+
+
+def test_history_save_failure_still_returns_the_reply(monkeypatch):
+    monkeypatch.setattr(inputHandler, "table", FakeTable(fail_put=True))
+    monkeypatch.setattr(inputHandler, "bedrock", FakeBedrock(response=good_reply("answer")))
+
+    result = inputHandler.lambda_handler(VALID_EVENT, None)
+
+    assert result["statusCode"] == 200
+    assert json.loads(result["body"]) == {"reply": "answer"}
