@@ -53,7 +53,6 @@ Logs are stored under:
   because authentication is enforced later by API Gateway's JWT authorizer.
 
 ## Sources
-
 - AWS WAF: logging to S3 (docs.aws.amazon.com/waf/latest/developerguide/logging-s3.html)
 - Athena: create a table for WAF logs using partition projection
   (docs.aws.amazon.com/athena/latest/ug/create-waf-table-partition-projection.html)
