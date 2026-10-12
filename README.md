@@ -112,9 +112,9 @@ Always filter on `log_time` (UTC). Athena bills by data scanned, and the filter 
 ## Repository layout
 
 ```
-inputHandler.py          Lambda handler
-test_inputHandler.py    unit tests
-athena/                 table definition, saved queries, notes
+inputHandler.py         Lambda handler
+test_inputHandler.py    Unit tests
+athena/                 Table definition, Saved Queries, Notes
 README.md
 ```
 
