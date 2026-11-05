@@ -67,7 +67,7 @@ flowchart LR
 - **Authentication:** API Gateway's JWT authorizer validates each token (issuer, audience/client ID, expiry) before Lambda runs. Missing or invalid token: 401.
 - **Per-user isolation:** the history key is `<Cognito sub>#<sessionId>`. The `sub` comes from the verified token, never from the request body, so a user can't ask for another user's history.
 - **Input limits:** Lambda rejects bad input (400) before calling Bedrock: 2,000-character message, 128-character session ID.
-- **Least-privilege Lambda role:** the inline policy allows `Query` and `PutItem` on one DynamoDB table. It cannot delete items, scan, or touch other tables. (`PutItem` can replace an item that has the same key.)
+- **Least-privilege Lambda role:** the inline policy allows `Query` and `PutItem` on one DynamoDB table. It cannot delete items, scan, or touch other tables. (`PutItem` can replace an item that has the same key.) Lambda role can also only access amazon nova lite, and access to other models is denied.
 - **Generic client errors:** Bedrock failures return a generic 502 instead of the real error.
 - **WAF:** the web ACL on CloudFront includes a rate-based rule (300 requests per 5 minutes per IP, action Block, tested: returned 403 after the limit) plus AWS managed rule groups.
 - **Log hygiene:** the `Authorization` header is redacted in WAF logs, so tokens don't land in S3 (shows as `REDACTED`).
